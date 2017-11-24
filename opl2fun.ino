@@ -1,23 +1,18 @@
+// https://docs.google.com/document/d/1l84JTpSqWExiOSZbDhcDflVmwDLP2fVsZtAa2XhSkeI/edit
+// https://photos.google.com/photo/AF1QipOQX2p_RnjAfk_JceSfqYZ8eBOw6Eqzg_BN3ZBJ
+
 #include <SPI.h>
 #include <SoftwareSerial.h>
 #include <MemoryFree.h>
 #include <avr/pgmspace.h>
-
-// https://docs.google.com/document/d/1l84JTpSqWExiOSZbDhcDflVmwDLP2fVsZtAa2XhSkeI/edit
-
-// TODO
-// * Use 644p for dedicated timers and extra serial ports
-// * Split opl2_write into interrupt routine
-// * Ensure bursts of MIDI are not corrupted
 
 #define PIN_SHIFT 13
 #define PIN_DATA  11
 #define PIN_RESET 10
 #define PIN_LATCH 9
 #define PIN_ADDR  8
-#define PIN_DEBUG_RX 2
-#define PIN_DEBUG_TX 3
-// https://photos.google.com/photo/AF1QipOQX2p_RnjAfk_JceSfqYZ8eBOw6Eqzg_BN3ZBJ
+#define PIN_SERIAL2_RX 2
+#define PIN_SERIAL2_TX 3
 
 #define FLAT  0x10
 #define FLAT2 0x20
@@ -34,12 +29,17 @@
 #define MIDI_STATE_PARAM2    3
 #define MIDI_STATE_EAT_SYSEX 4
 
-#define MIDI Serial
-#define Debug(s) DebugSerial.print(s)
-SoftwareSerial DebugSerial(PIN_DEBUG_RX, PIN_DEBUG_TX);
-// SoftwareSerial was too slow for MIDI RX
+#define MIDI   Serial
+#define DEBUG  Serial2
+SoftwareSerial Serial2(PIN_SERIAL2_RX, PIN_SERIAL2_TX);
+// SoftwareSerial is too slow for MIDI
 
+#define OPL2_QUEUE_SIZE 256
+byte opl2_sync;
 byte opl2_reg[256];
+int  opl2_queue[OPL2_QUEUE_SIZE];
+int  opl2_queue_write_idx;
+int  opl2_queue_read_idx;
 
 byte insts_count;
 byte insts[4];
@@ -62,65 +62,67 @@ byte chord[4];
 
 byte note2scale[128];
 
+byte chord_cc_enabled;
+
 #define NUM_SCALES 16
 const PROGMEM byte scales[NUM_SCALES][12] = {
     // { scale_len, scale_degree_1, ..., scale_degree_n }
-    { 7,   2, 4, 5, 7, 9, 11, 12,   14, 16, 17, 18 },         // major
-    { 7,   2, 3, 5, 7, 9, 10, 12,   14, 15, 17, 19 },         // dorian
-    { 7,   1, 3, 5, 7, 8, 10, 12,   13, 15, 17, 19 },         // phrygian
-    { 7,   2, 4, 6, 7, 9, 11, 12,   14, 16, 18, 19 },         // lydian
-    { 7,   2, 4, 5, 7, 9, 10, 12,   14, 16, 17, 19 },         // mixolydian
-    { 7,   2, 3, 5, 7, 8, 10, 12,   14, 15, 17, 19 },         // minor
-    { 7,   1, 3, 5, 6, 8, 10, 12,   13, 15, 17, 18 },         // locrian
-    { 7,   2, 3, 5, 7, 8, 11, 12,   14, 15, 17, 19 },         // harmonic minor
-    { 7,   2, 3, 5, 7, 9, 11, 12,   14, 15, 17, 19 },         // melodic minor
-    { 7,   2, 3, 5, 6, 8,  9, 11,   13, 14, 16, 17 },         // diminished
-    { 7,   1, 4, 6, 8, 10,11, 12,   13, 16, 17, 18 },         // enigmatic
-    { 6,      2, 4, 6, 8, 10, 12,   14, 16, 18, 20, 22 },     // whole
-    { 6,      3, 4, 7, 8, 11, 12,   15, 16, 19, 20, 23 },     // augmented
-    { 6,      3, 5, 6, 7, 10, 12,   15, 17, 18, 19, 21 },     // blues
-    { 5,          2, 4, 7, 9, 12,   14, 16, 19, 21, 24, 26 }, // major pentatonic
-    { 5,          3, 5, 7, 9, 12,   15, 17, 19, 21, 23, 26 }  // minor pentatonic
+    { 7,   2, 4, 5, 7, 9, 11, 12,   14, 16, 17, 18 },         // 0   major
+    { 7,   2, 3, 5, 7, 9, 10, 12,   14, 15, 17, 19 },         // 1   dorian
+    { 7,   1, 3, 5, 7, 8, 10, 12,   13, 15, 17, 19 },         // 2   phrygian
+    { 7,   2, 4, 6, 7, 9, 11, 12,   14, 16, 18, 19 },         // 3   lydian
+    { 7,   2, 4, 5, 7, 9, 10, 12,   14, 16, 17, 19 },         // 4   mixolydian
+    { 7,   2, 3, 5, 7, 8, 10, 12,   14, 15, 17, 19 },         // 5   minor
+    { 7,   1, 3, 5, 6, 8, 10, 12,   13, 15, 17, 18 },         // 6   locrian
+    { 7,   2, 3, 5, 7, 8, 11, 12,   14, 15, 17, 19 },         // 7   harmonic minor
+    { 7,   2, 3, 5, 7, 9, 11, 12,   14, 15, 17, 19 },         // 8   melodic minor
+    { 7,   2, 3, 5, 6, 8,  9, 11,   13, 14, 16, 17 },         // 9   diminished
+    { 7,   1, 4, 6, 8, 10,11, 12,   13, 16, 17, 18 },         // 10  enigmatic
+    { 6,      2, 4, 6, 8, 10, 12,   14, 16, 18, 20, 22 },     // 11  whole
+    { 6,      3, 4, 7, 8, 11, 12,   15, 16, 19, 20, 23 },     // 12  augmented
+    { 6,      3, 5, 6, 7, 10, 12,   15, 17, 18, 19, 21 },     // 13  blues
+    { 5,          2, 4, 7, 9, 12,   14, 16, 19, 21, 24, 26 }, // 14  major pentatonic
+    { 5,          3, 5, 7, 9, 12,   15, 17, 19, 21, 23, 26 }  // 15  minor pentatonic
 };
 
 #define NUM_CHORDS 34
 const PROGMEM byte chords[NUM_CHORDS][3] = {
     // 0x1_ == flat, 0x2_ == flat2, 0x4_ == sharp
-    { 2, 4, NONE },                  // maj
-    { 3, 4, NONE },                  // sus4
-    { 1, 4, NONE },                  // sus2
-    { 0x12, 0x14, NONE },            // dim
-    { 0x12, 0x14, 0x26 },            // dim7
-    { 2, 0x44, NONE },               // aug
-    { 2, 3, 4 },                     // add4
-    { 2, 4, 5 },                     // 6
-    { 2, 4, 6 },                     // 7
-    { 2, 4, 8 },                     // add9
-    { 2, 4, 10 },                    // 11
-    { 2, 4, 0x4a },                  // #11
-    { 2, 4, 12 },                    // 13
-    { 2, 0x14, NONE },               // b5
-    { 2, 4, 0x16 },                  // b7
-    { 2, 0x44, 0x16 },               // 7#5
-    { 2, 0x14, 0x16 },               // 7b5
+    { 2, 4, NONE },                  // 0   maj
+    { 3, 4, NONE },                  // 1   sus4
+    { 1, 4, NONE },                  // 2   sus2
+    { 0x12, 0x14, NONE },            // 3   dim
+    { 0x12, 0x14, 0x26 },            // 4   dim7
+    { 2, 0x44, NONE },               // 5   aug
+    { 2, 3, 4 },                     // 6   add4
+    { 2, 4, 5 },                     // 7   6
+    { 2, 4, 6 },                     // 8   7
+    { 2, 4, 8 },                     // 9   add9
+    { 2, 4, 10 },                    // 10  11
+    { 2, 4, 0x4a },                  // 11  #11
+    { 2, 4, 12 },                    // 12  13
+    { 2, 0x14, NONE },               // 13  b5
+    { 2, 4, 0x16 },                  // 14  b7
+    { 2, 0x44, 0x16 },               // 15  7#5
+    { 2, 0x14, 0x16 },               // 16  7b5
 
-    { 0x12, 4, NONE },               // min
-    { 0x13, 4, NONE },               // msus4
-    { 0x11, 4, NONE },               // msus2
-    { 0x22, 0x14, NONE },            // mdim
-    { 0x22, 0x14, 0x26 },            // mdim7
-    { 0x12, 0x44, NONE },            // maug
-    { 0x12, 3, 4 },                  // madd4
-    { 0x12, 4, 5 },                  // m6
-    { 0x12, 4, 6 },                  // m7
-    { 0x12, 4, 8 },                  // madd9
-    { 0x12, 4, 10 },                 // m11
-    { 0x12, 4, 0x4a },               // m#11
-    { 0x12, 4, 12 },                 // m13
-    { 0x12, 0x44, NONE },            // mb5
-    { 0x12, 4, 0x16 },               // mb7
-    { 0x12, 0x44, 0x16 },            // m7#5
-    { 0x12, 0x14, 0x16 }             // m7b5
+    { 0x12, 4, NONE },               // 17  min
+    { 0x13, 4, NONE },               // 18  msus4
+    { 0x11, 4, NONE },               // 19  msus2
+    { 0x22, 0x14, NONE },            // 20  mdim
+    { 0x22, 0x14, 0x26 },            // 21  mdim7
+    { 0x12, 0x44, NONE },            // 22  maug
+    { 0x12, 3, 4 },                  // 23  madd4
+    { 0x12, 4, 5 },                  // 24  m6
+    { 0x12, 4, 6 },                  // 25  m7
+    { 0x12, 4, 8 },                  // 26  madd9
+    { 0x12, 4, 10 },                 // 27  m11
+    { 0x12, 4, 0x4a },               // 28  m#11
+    { 0x12, 4, 12 },                 // 29  m13
+    { 0x12, 0x44, NONE },            // 30  mb5
+    { 0x12, 4, 0x16 },               // 31  mb7
+    { 0x12, 0x44, 0x16 },            // 32  m7#5
+    { 0x12, 0x14, 0x16 }             // 33  m7b5
 };
 
 const PROGMEM byte op2offset[2][9] = {
@@ -235,7 +237,7 @@ const PROGMEM byte cc2bit[7][128] = {
 };
 
 void setup() {
-    Debug.begin(9600);
+    DEBUG.begin(9600);
     MIDI.begin(31250);
     SPI.begin();
 
@@ -255,6 +257,11 @@ void setup() {
     fill_scale();
 
     midi_state = MIDI_STATE_INIT;
+
+    opl2_queue_write_idx = 0;
+    opl2_queue_read_idx = 0;
+
+    chord_cc_enabled = 1;
 
     opl2_reset();
 }
@@ -318,12 +325,16 @@ void loop() {
                 break;
         }
     }
+    if (opl2_queue_read_idx != opl2_queue_write_idx) {
+        opl2_dequeue_one();
+    }
 }
 
 void handle_midi_note(byte chan, byte note, byte vel) {
     byte fhi, flo, blk, i;
 
     if (chan < 6) {
+        if (note == 0) return;
         // tonal
         if (chan > 1) {
             chan = 2;
@@ -339,85 +350,98 @@ void handle_midi_note(byte chan, byte note, byte vel) {
                 flo = pgm_read_byte(&note2freq[0][note & 0x7f]);
                 fhi = pgm_read_byte(&note2freq[1][note & 0x7f]);
                 blk = pgm_read_byte(&note2freq[2][note & 0x7f]);
-                opl2_write_bits_scaled(0x40, chan + i, OP_1, 0, 6, 127-vel);
                 opl2_write_bits_scaled(0x40, chan + i, OP_2, 0, 6, 127-vel);
+                // opl2_write_bits_scaled(0x40, chan + i, OP_1, 0, 6, 127-vel);
                 opl2_write(0xa0 + chan + i, flo);
                 opl2_write(0xb0 + chan + i, 0x20 | (blk << 2) | fhi);
             } else {
                 opl2_write_bits(0xb0, chan + i, INST, 5, 1, 0);
             }
         }
-    } else {
+    } else if (chan < 11 && note > 0) {
         // percussion
-        opl2_write_bits(0xbd, 0, INST, chan - 6, 1, vel > 0 ? 1 : 0);
+        opl2_write_bits(0xbd, 0, INST, 4 - (chan - 6), 1, vel > 0 ? 1 : 0);
     }
 }
 
-void handle_midi_cc(byte chan, byte cc, byte val) {
-    byte tmp;
+void handle_midi_cc(byte ichan, byte cc, byte val) {
+    byte chan, start_chan, end_chan, tmp;
 
     // handle channels 0 thru 8 (9 instruments)
-    if (chan > 8) return;
+    if (ichan > 8) return;
 
-    switch (cc) {
-        // TODO case 2-4 hardfreq
-        case  2: tmp = pgm_read_byte(&cc2bit[3][val]);
-                 opl2_write_bits_scaled(0xa0, chan, INST, 5, 2, tmp >> 2);   // freq_hi4
-                 opl2_write_bits_scaled(0xb0, chan, INST, 0, 2, tmp & 0x03);
-                 break;
-        case  3: opl2_write_bits_scaled(0xa0, chan, INST, 0, 6, val); break; // freq_lo6
-        case  4: opl2_write_bits_scaled(0xb0, chan, INST, 2, 3, val); break; // freq_blk
-
-        case  5: opl2_write_bits_scaled(0xc0, chan, INST, 1, 3, val); break; // inst_feedback
-
-        case  6: opl2_write_bits_scaled(0xe0, chan, OP_2, 0, 2, val); break; // op2_waveform
-        case  7: opl2_write_bits_scaled(0xe0, chan, OP_1, 0, 2, val); break; // op1_waveform
-
-        case  8: opl2_write_bits_scaled(0x40, chan, OP_2, 0, 6, val); break; // op2_level
-        case  9: opl2_write_bits_scaled(0x40, chan, OP_1, 0, 6, val); break; // op1_level
-
-        case 10: opl2_write_bits_scaled(0x20, chan, OP_2, 0, 4, val); break; // op2_modfreq
-        case 11: opl2_write_bits_scaled(0x20, chan, OP_1, 0, 4, val); break; // op1_modfreq
-
-        case 12: opl2_write_bits_scaled(0x60, chan, OP_2, 4, 4, val); break; // op2_env_attack
-        case 13: opl2_write_bits_scaled(0x60, chan, OP_2, 0, 4, val); break; // op2_env_decay
-        case 14: opl2_write_bits_scaled(0x80, chan, OP_2, 4, 4, val); break; // op2_env_sustain
-        case 15: opl2_write_bits_scaled(0x80, chan, OP_2, 0, 4, val); break; // op2_env_release
-
-        case 16: opl2_write_bits_scaled(0x60, chan, OP_1, 4, 4, val); break; // op1_env_attack
-        case 17: opl2_write_bits_scaled(0x60, chan, OP_1, 0, 4, val); break; // op1_env_decay
-        case 18: opl2_write_bits_scaled(0x80, chan, OP_1, 4, 4, val); break; // op1_env_sustain
-        case 19: opl2_write_bits_scaled(0x80, chan, OP_1, 0, 4, val); break; // op1_env_release
-
-        case 20: opl2_write_bits_scaled(0x40, chan, OP_2, 6, 2, val); break; // op2_levscale
-        case 21: opl2_write_bits_scaled(0x40, chan, OP_1, 6, 2, val); break; // op1_levscale
-
-        case 22: opl2_write_bits_scaled(0x20, chan, OP_2, 7, 1, val); break; // op2_ampmod
-        case 23: opl2_write_bits_scaled(0x20, chan, OP_2, 6, 1, val); break; // op2_vibrato
-        case 24: opl2_write_bits_scaled(0x20, chan, OP_2, 5, 1, val); break; // op2_sustain_on
-        case 25: opl2_write_bits_scaled(0x20, chan, OP_2, 4, 1, val); break; // op2_envscale
-
-        case 26: opl2_write_bits_scaled(0x20, chan, OP_1, 7, 1, val); break; // op1_ampmod
-        case 27: opl2_write_bits_scaled(0x20, chan, OP_1, 6, 1, val); break; // op1_vibrato
-        case 28: opl2_write_bits_scaled(0x20, chan, OP_1, 5, 1, val); break; // op1_sustain_on
-        case 29: opl2_write_bits_scaled(0x20, chan, OP_1, 4, 1, val); break; // op1_envscale
-
-        case 30: opl2_write_bits_scaled(0xc0, chan, INST, 0, 1, val); break; // inst_fm
-
-        case 31: scale_root  = val % 12;         fill_scale(); break;        // scale_root
-        case 32: scale_type  = val % NUM_SCALES; fill_scale(); break;        // scale_type
-        case 33: scale_chord = val % NUM_CHORDS; break;                      // scale_chord
-
-        // TODO lfo
-
-        // TODO trigcond
-
-        // TODO trigfx
-
-        // TODO arp
-
-        // TODO global
+    // if chord_cc_enabled, apply cc to all chord instruments
+    if (chord_cc_enabled && ichan > 1) {
+        start_chan = 2;
+        end_chan = 5;
+    } else {
+        start_chan = ichan;
+        end_chan = ichan;
     }
+
+    for (chan = start_chan; chan <= end_chan; ++chan) {
+        switch (cc) {
+            case  2: tmp = pgm_read_byte(&cc2bit[3][val]);
+                     opl2_write_bits_scaled(0xa0, chan, INST, 5, 2, tmp >> 2);       // freq_hi4
+                     opl2_write_bits_scaled(0xb0, chan, INST, 0, 2, tmp & 0x03);
+                     break;
+            case  3: opl2_write_bits_scaled(0xa0, chan, INST, 0, 6, val);     break; // freq_lo6
+            case  4: opl2_write_bits_scaled(0xb0, chan, INST, 2, 3, val);     break; // freq_blk
+
+            case  5: opl2_write_bits_scaled(0xc0, chan, INST, 1, 3, val);     break; // inst_feedback
+
+            case  6: opl2_write_bits_scaled(0xe0, chan, OP_2, 0, 2, val);     break; // op2_waveform
+            case  7: opl2_write_bits_scaled(0xe0, chan, OP_1, 0, 2, val);     break; // op1_waveform
+
+            case  8: opl2_write_bits_scaled(0x40, chan, OP_2, 0, 6, 127-val); break; // op2_level
+            case  9: opl2_write_bits_scaled(0x40, chan, OP_1, 0, 6, 127-val); break; // op1_level
+
+            case 10: opl2_write_bits_scaled(0x20, chan, OP_2, 0, 4, val);     break; // op2_modfreq
+            case 11: opl2_write_bits_scaled(0x20, chan, OP_1, 0, 4, val);     break; // op1_modfreq
+
+            case 12: opl2_write_bits_scaled(0x60, chan, OP_2, 4, 4, val);     break; // op2_env_attack
+            case 13: opl2_write_bits_scaled(0x60, chan, OP_2, 0, 4, val);     break; // op2_env_decay
+            case 14: opl2_write_bits_scaled(0x80, chan, OP_2, 4, 4, 127-val); break; // op2_env_sustain
+            case 15: opl2_write_bits_scaled(0x80, chan, OP_2, 0, 4, 127-val); break; // op2_env_release
+
+            case 16: opl2_write_bits_scaled(0x60, chan, OP_1, 4, 4, val);     break; // op1_env_attack
+            case 17: opl2_write_bits_scaled(0x60, chan, OP_1, 0, 4, val);     break; // op1_env_decay
+            case 18: opl2_write_bits_scaled(0x80, chan, OP_1, 4, 4, 127-val); break; // op1_env_sustain
+            case 19: opl2_write_bits_scaled(0x80, chan, OP_1, 0, 4, 127-val); break; // op1_env_release
+
+            case 20: opl2_write_bits_scaled(0x40, chan, OP_2, 6, 2, val);     break; // op2_levscale
+            case 21: opl2_write_bits_scaled(0x40, chan, OP_1, 6, 2, val);     break; // op1_levscale
+
+            case 22: opl2_write_bits_scaled(0x20, chan, OP_2, 7, 1, val);     break; // op2_ampmod
+            case 23: opl2_write_bits_scaled(0x20, chan, OP_2, 6, 1, val);     break; // op2_vibrato
+            case 24: opl2_write_bits_scaled(0x20, chan, OP_2, 5, 1, val);     break; // op2_sustain_on
+            case 25: opl2_write_bits_scaled(0x20, chan, OP_2, 4, 1, val);     break; // op2_envscale
+
+            case 26: opl2_write_bits_scaled(0x20, chan, OP_1, 7, 1, val);     break; // op1_ampmod
+            case 27: opl2_write_bits_scaled(0x20, chan, OP_1, 6, 1, val);     break; // op1_vibrato
+            case 28: opl2_write_bits_scaled(0x20, chan, OP_1, 5, 1, val);     break; // op1_sustain_on
+            case 29: opl2_write_bits_scaled(0x20, chan, OP_1, 4, 1, val);     break; // op1_envscale
+
+            case 30: opl2_write_bits_scaled(0xc0, chan, INST, 0, 1, val);     break; // inst_fm
+
+            case 31: scale_root  = val % 12;         fill_scale(); goto cc_done;     // scale_root
+            case 32: scale_type  = val % NUM_SCALES; fill_scale(); goto cc_done;     // scale_type
+            case 33: scale_chord = val % NUM_CHORDS; goto cc_done;                   // scale_chord
+
+            // TODO lfo
+
+            // TODO trigcond
+
+            // TODO trigfx
+
+            // TODO arp
+
+            // TODO global
+            //      amdep, vibdep, chord_cc_enabled
+        }
+    }
+cc_done: (void)cc;
+
 }
 
 void handle_midi_time(byte val) {
@@ -511,6 +535,9 @@ void opl2_write_bits(byte sreg, byte inst, int op, byte bitoffset, byte nbits, b
 void opl2_reset() {
     int i;
 
+    // enable sync writes
+    opl2_sync = 1;
+
     // reset
     digitalWrite(PIN_RESET, LOW);
     delay(1);
@@ -521,7 +548,7 @@ void opl2_reset() {
     for (i = 0; i <= 0xff; ++i) opl2_write(i, 0x00);
 
     // enable waveform select
-    opl2_write(0x01, 0x10);
+    opl2_write(0x01, 0x20);
 
     // enable rhythm mode
     opl2_write(0xbd, 0x20);
@@ -549,9 +576,12 @@ void opl2_reset() {
         opl2_write(0xa0 + i, 0x8b); // medium freq
         opl2_write(0xb0 + i, 0x06);
     }
+
+    // disable sync writes
+    opl2_sync = 1;
 }
 
-void opl2_write(byte reg, byte data) {
+void opl2_write_real(byte reg, byte data) {
     // exit early if no change
     if (opl2_reg[reg] == data) return;
 
@@ -575,6 +605,23 @@ void opl2_write(byte reg, byte data) {
     opl2_reg[reg] = data;
 }
 
+void opl2_write(byte reg, byte data) {
+    if (opl2_sync) {
+        opl2_write_real(reg, data);
+    } else {
+        opl2_queue[opl2_queue_write_idx] = ((int)reg << 8) | (int)data;
+        opl2_queue_write_idx += 1;
+        if (opl2_queue_write_idx >= OPL2_QUEUE_SIZE) opl2_queue_write_idx = 0;
+    }
+}
+
+void opl2_dequeue_one() {
+    int reg_data;
+    reg_data = opl2_queue[opl2_queue_read_idx];
+    opl2_write_real((reg_data & 0xff00) >> 8, reg_data & 0xff);
+    opl2_queue_read_idx += 1;
+    if (opl2_queue_read_idx >= OPL2_QUEUE_SIZE) opl2_queue_read_idx = 0;
+}
 
 /*
 void beep() {
