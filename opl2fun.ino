@@ -17,8 +17,10 @@
 #define PIN_RESET 10
 #define PIN_LATCH 9
 #define PIN_ADDR  8
-#define PIN_SERIAL2_RX 2
-#define PIN_SERIAL2_TX 3
+#define PIN_LED   2
+#define PIN_GND   7
+#define PIN_SERIAL2_RX 4
+#define PIN_SERIAL2_TX 5
 
 #define FLAT  0x10
 #define FLAT2 0x20
@@ -42,7 +44,7 @@ SoftwareSerial Serial2(PIN_SERIAL2_RX, PIN_SERIAL2_TX);
 byte opl2_mem[256];
 byte opl2_write_sync;
 
-#define MAX_EVENTS 128
+#define MAX_EVENTS 64
 typedef struct event_s {
     byte reg;
     byte data;
@@ -53,7 +55,7 @@ event_t *find_free_event();
 event_t events[MAX_EVENTS];
 event_t *event_tmp;
 
-#define SEQ_SIZE 192
+#define SEQ_SIZE 96
 event_t *seq[SEQ_SIZE];
 
 byte insts_count;
@@ -77,9 +79,32 @@ byte scale_root;
 byte scale_chord;
 byte chord[4];
 
+byte trigcond_p1[8];
+byte trigcond_p2[8];
+byte trigcond_count[8];
+
+byte trigfx_idelay[8];
+byte trigfx_nrepeat[8];
+byte trigfx_rdelay[8];
+byte trigfx_rdelta[8];
+
+#define ARP_VEL 127
+#define ARP_NOTE_OFF_DELTA 6
+byte arp_len[3];
+byte arp_notenum[36];
+byte arp_notelen[36];
+byte arp_on[3];
+byte arp_idx[3];
+byte arp_count[3];
+
+byte trig_group_idx;
+byte arp_group_idx;
+
 byte note2scale[128];
 
 byte chord_cc_enabled;
+
+byte led;
 
 #define NUM_SCALES 16
 const PROGMEM byte scales[NUM_SCALES][12] = {
@@ -258,12 +283,18 @@ void setup() {
     MIDI.begin(31250);
     SPI.begin();
 
+    pinMode(PIN_SHIFT, OUTPUT);
+    pinMode(PIN_DATA,  OUTPUT);
+    pinMode(PIN_RESET, OUTPUT);
     pinMode(PIN_LATCH, OUTPUT);
     pinMode(PIN_ADDR,  OUTPUT);
-    pinMode(PIN_RESET, OUTPUT);
+    pinMode(PIN_GND, OUTPUT);
+    pinMode(PIN_LED, OUTPUT);
+
     digitalWrite(PIN_LATCH, HIGH);
     digitalWrite(PIN_RESET, HIGH);
     digitalWrite(PIN_ADDR,  LOW);
+    digitalWrite(PIN_GND, LOW);
 
     time_play = 0;
     time_seq_idx_current = 0;
@@ -278,10 +309,28 @@ void setup() {
     midi_state = MIDI_STATE_INIT;
 
     memset(&events, 0, MAX_EVENTS * sizeof(event_t));
-    memset(seq,     0, SEQ_SIZE * sizeof(event_t));
+    memset(seq,     0, SEQ_SIZE   * sizeof(event_t*));
     event_tmp = NULL;
 
+    memset(&trigcond_p1,    0, 8  * sizeof(byte));
+    memset(&trigcond_p2,    0, 8  * sizeof(byte));
+    memset(&trigcond_count, 0, 8  * sizeof(byte));
+
+    memset(&trigfx_idelay,  0, 8  * sizeof(byte));
+    memset(&trigfx_nrepeat, 0, 8  * sizeof(byte));
+    memset(&trigfx_rdelay,  0, 8  * sizeof(byte));
+    memset(&trigfx_rdelta,  0, 8  * sizeof(byte));
+
+    memset(&arp_len,        0, 3  * sizeof(byte));
+    memset(&arp_notenum,    0, 36 * sizeof(byte));
+    memset(&arp_notelen,    0, 36 * sizeof(byte));
+    memset(&arp_on,         0, 3  * sizeof(byte));
+    memset(&arp_idx,        0, 3  * sizeof(byte));
+    memset(&arp_count,      0, 3  * sizeof(byte));
+
     chord_cc_enabled = 1;
+
+    led = 0;
 
     opl2_reset();
 }
@@ -305,11 +354,13 @@ void loop() {
                     midi_status = midi_byte;
                     midi_state = MIDI_STATE_PARAM1;
                 } else if (midi_type == 0xf0) {
-                    // sysex (ignore)
-                    midi_state = MIDI_STATE_EAT_SYSEX;
-                } else if (midi_type == 0xf0) {
-                    // time (accept)
-                    handle_midi_time(midi_byte);
+                    if (midi_byte != 0xf0) {
+                        // time (accept)
+                        handle_midi_time(midi_byte);
+                    } else {
+                        // sysex (ignore)
+                        midi_state = MIDI_STATE_EAT_SYSEX;
+                    }
                 } else if (midi_byte <= 0x7f) {
                     // running status!
                     midi_param1 = midi_byte;
@@ -350,16 +401,83 @@ void loop() {
     }
 }
 
+void set_group_idxs(byte ichan) {
+    if (ichan <= 2) {
+        trig_group_idx = ichan;
+        arp_group_idx = ichan;
+    } else if (ichan >= 3 && ichan <= 5) {
+        trig_group_idx = 2;
+        arp_group_idx = 2;
+    } else {
+        trig_group_idx = ichan - 3;
+        arp_group_idx = 0; // no arp for drums, apply to chan 0 for now
+    }
+}
+
 void handle_midi_note(byte chan, byte note, byte vel) {
+    byte tmp, i;
+
+    // set trig_group_idx, arp_group_idx
+    set_group_idxs(chan);
+
+    // apply arp
+    if (arp_len[arp_group_idx] > 0) {
+        arp_on[arp_group_idx] = vel > 0 ? 1 : 0;
+        return;
+    }
+
+    // apply trigcond
+    if (vel > 0) {
+        if (trigcond_p2[trig_group_idx] == 0) {
+            // skip % (0==skip none, 127==skip all)
+            if (trigcond_p1[trig_group_idx] > random(127)) {
+                return;
+            }
+        } else {
+            // n:m (for each m trigs, trig the nth one)
+            tmp = trigcond_count[trig_group_idx];
+            ++trigcond_count[trig_group_idx];
+            if (trigcond_count[trig_group_idx] >= trigcond_p2[trig_group_idx]) {
+                trigcond_count[trig_group_idx] = 0;
+            }
+            if (tmp != trigcond_p1[trig_group_idx]) {
+                return;
+            }
+        }
+    }
+
+    // apply trigfx idelay
+    time_seq_queue_delta = trigfx_idelay[trig_group_idx];
+    handle_note(chan, note, vel);
+
+    // apply trigfx repeat
+    tmp = trigfx_rdelay[trig_group_idx];
+    for (i = 0; i < trigfx_nrepeat[trig_group_idx]; ++i) {
+        time_seq_queue_delta += tmp;
+        handle_note(chan, note, vel);
+        tmp += (trigfx_rdelta[trig_group_idx] > 0 ? trigfx_rdelta[trig_group_idx] : 64)  - 64;
+        if (tmp < 3) {
+            tmp = 3;
+        } else if (tmp >= SEQ_SIZE) {
+            tmp = SEQ_SIZE-1;
+        }
+    }
+
+    time_seq_queue_delta = 0;
+}
+
+void handle_note(byte chan, byte note, byte vel) {
     byte fhi, flo, blk, i;
 
     if (chan < 6) {
-        if (note == 0) return;
-        // tonal
+        // melodic / tonal
+        if (note == 0) return; // interpet note==0 as trigless trig
         if (chan > 1) {
+            // chord
             chan = 2;
             fill_chord(note);
         } else {
+            // lead, bass
             chord[0] = note;
             chord[1] = NONE;
         }
@@ -379,7 +497,7 @@ void handle_midi_note(byte chan, byte note, byte vel) {
             }
         }
     } else if (chan < 11 && note > 0) {
-        // percussion
+        // rhythm / percussion
         opl2_write_bits(0xbd, 0, INST, 4 - (chan - 6), 1, vel > 0 ? 1 : 0);
     }
 }
@@ -406,6 +524,9 @@ void handle_midi_cc(byte ichan, byte cc, byte val) {
     // handle channels 0 thru 10
     if (ichan >= 11) return;
 
+    // set trig_group_idx, arp_group_idx
+    set_group_idxs(ichan);
+
     // force correct opl2 chan for percussion
     op1 = OP_1;
     op2 = OP_2;
@@ -429,90 +550,146 @@ void handle_midi_cc(byte ichan, byte cc, byte val) {
 
     for (chan = start_chan; chan <= end_chan; ++chan) {
         switch (cc) {
-            case  2: tmp = pgm_read_byte(&cc2bit[3][val]);
-                     opl2_write_bits_scaled(0xa0, chan, INST, 5, 2, tmp >> 2);       // freq_hi4
-                     opl2_write_bits_scaled(0xb0, chan, INST, 0, 2, tmp & 0x03);
-                     break;
-            case  3: opl2_write_bits_scaled(0xa0, chan, INST, 0, 6, val);     break; // freq_lo6
-            case  4: opl2_write_bits_scaled(0xb0, chan, INST, 2, 3, val);     break; // freq_blk
+            case   2: tmp = pgm_read_byte(&cc2bit[3][val]);
+                      opl2_write_bits_scaled(0xa0, chan, INST, 5, 2, tmp >> 2);        // freq_hi4
+                      opl2_write_bits_scaled(0xb0, chan, INST, 0, 2, tmp & 0x03);
+                      break;
+            case   3: opl2_write_bits_scaled(0xa0, chan, INST, 0, 6, val);      break; // freq_lo6
+            case   4: opl2_write_bits_scaled(0xb0, chan, INST, 2, 3, val);      break; // freq_blk
 
-            case  5: opl2_write_bits_scaled(0xc0, chan, INST, 1, 3, val);     break; // inst_feedback
+            case   5: opl2_write_bits_scaled(0xc0, chan, INST, 1, 3, val);      break; // inst_feedback
 
-            case  6: opl2_write_bits_scaled(0xe0, chan, op2,  0, 2, val);     break; // op2_waveform
-            case  7: opl2_write_bits_scaled(0xe0, chan, op1,  0, 2, val);     break; // op1_waveform
+            case   6: opl2_write_bits_scaled(0xe0, chan, op2,  0, 2, val);      break; // op2_waveform
+            case   7: opl2_write_bits_scaled(0xe0, chan, op1,  0, 2, val);      break; // op1_waveform
 
-            case  8: opl2_write_bits_scaled(0x40, chan, op2,  0, 6, 127-val); break; // op2_level
-            case  9: opl2_write_bits_scaled(0x40, chan, op1,  0, 6, 127-val); break; // op1_level
+            case   8: opl2_write_bits_scaled(0x40, chan, op2,  0, 6, 127-val);  break; // op2_level
+            case   9: opl2_write_bits_scaled(0x40, chan, op1,  0, 6, 127-val);  break; // op1_level
 
-            case 10: opl2_write_bits_scaled(0x20, chan, op2,  0, 4, val);     break; // op2_modfreq
-            case 11: opl2_write_bits_scaled(0x20, chan, op1,  0, 4, val);     break; // op1_modfreq
+            case  10: opl2_write_bits_scaled(0x20, chan, op2,  0, 4, val);      break; // op2_modfreq
+            case  11: opl2_write_bits_scaled(0x20, chan, op1,  0, 4, val);      break; // op1_modfreq
 
-            case 12: opl2_write_bits_scaled(0x60, chan, op2,  4, 4, val);     break; // op2_env_attack
-            case 13: opl2_write_bits_scaled(0x60, chan, op2,  0, 4, val);     break; // op2_env_decay
-            case 14: opl2_write_bits_scaled(0x80, chan, op2,  4, 4, 127-val); break; // op2_env_sustain
-            case 15: opl2_write_bits_scaled(0x80, chan, op2,  0, 4, 127-val); break; // op2_env_release
+            case  12: opl2_write_bits_scaled(0x60, chan, op2,  4, 4, val);      break; // op2_env_attack
+            case  13: opl2_write_bits_scaled(0x60, chan, op2,  0, 4, val);      break; // op2_env_decay
+            case  14: opl2_write_bits_scaled(0x80, chan, op2,  4, 4, 127-val);  break; // op2_env_sustain
+            case  15: opl2_write_bits_scaled(0x80, chan, op2,  0, 4, 127-val);  break; // op2_env_release
 
-            case 16: opl2_write_bits_scaled(0x60, chan, op1,  4, 4, val);     break; // op1_env_attack
-            case 17: opl2_write_bits_scaled(0x60, chan, op1,  0, 4, val);     break; // op1_env_decay
-            case 18: opl2_write_bits_scaled(0x80, chan, op1,  4, 4, 127-val); break; // op1_env_sustain
-            case 19: opl2_write_bits_scaled(0x80, chan, op1,  0, 4, 127-val); break; // op1_env_release
+            case  16: opl2_write_bits_scaled(0x60, chan, op1,  4, 4, val);      break; // op1_env_attack
+            case  17: opl2_write_bits_scaled(0x60, chan, op1,  0, 4, val);      break; // op1_env_decay
+            case  18: opl2_write_bits_scaled(0x80, chan, op1,  4, 4, 127-val);  break; // op1_env_sustain
+            case  19: opl2_write_bits_scaled(0x80, chan, op1,  0, 4, 127-val);  break; // op1_env_release
 
-            case 20: opl2_write_bits_scaled(0x40, chan, op2,  6, 2, val);     break; // op2_levscale
-            case 21: opl2_write_bits_scaled(0x40, chan, op1,  6, 2, val);     break; // op1_levscale
+            case  20: opl2_write_bits_scaled(0x40, chan, op2,  6, 2, val);      break; // op2_levscale
+            case  21: opl2_write_bits_scaled(0x40, chan, op1,  6, 2, val);      break; // op1_levscale
 
-            case 22: opl2_write_bits_scaled(0x20, chan, op2,  7, 1, val);     break; // op2_ampmod
-            case 23: opl2_write_bits_scaled(0x20, chan, op2,  6, 1, val);     break; // op2_vibrato
-            case 24: opl2_write_bits_scaled(0x20, chan, op2,  5, 1, val);     break; // op2_sustain_on
-            case 25: opl2_write_bits_scaled(0x20, chan, op2,  4, 1, val);     break; // op2_envscale
+            case  22: opl2_write_bits_scaled(0x20, chan, op2,  7, 1, val);      break; // op2_ampmod
+            case  23: opl2_write_bits_scaled(0x20, chan, op2,  6, 1, val);      break; // op2_vibrato
+            case  24: opl2_write_bits_scaled(0x20, chan, op2,  5, 1, val);      break; // op2_sustain_on
+            case  25: opl2_write_bits_scaled(0x20, chan, op2,  4, 1, val);      break; // op2_envscale
 
-            case 26: opl2_write_bits_scaled(0x20, chan, op1,  7, 1, val);     break; // op1_ampmod
-            case 27: opl2_write_bits_scaled(0x20, chan, op1,  6, 1, val);     break; // op1_vibrato
-            case 28: opl2_write_bits_scaled(0x20, chan, op1,  5, 1, val);     break; // op1_sustain_on
-            case 29: opl2_write_bits_scaled(0x20, chan, op1,  4, 1, val);     break; // op1_envscale
+            case  26: opl2_write_bits_scaled(0x20, chan, op1,  7, 1, val);      break; // op1_ampmod
+            case  27: opl2_write_bits_scaled(0x20, chan, op1,  6, 1, val);      break; // op1_vibrato
+            case  28: opl2_write_bits_scaled(0x20, chan, op1,  5, 1, val);      break; // op1_sustain_on
+            case  29: opl2_write_bits_scaled(0x20, chan, op1,  4, 1, val);      break; // op1_envscale
 
-            case 30: opl2_write_bits_scaled(0xc0, chan, INST, 0, 1, val);     break; // inst_fm
+            case  30: opl2_write_bits_scaled(0xc0, chan, INST, 0, 1, val);      break; // inst_fm
 
-            case 31: scale_root  = val % 12;         fill_scale(); goto cc_done;     // scale_root
-            case 32: scale_type  = val % NUM_SCALES; fill_scale(); goto cc_done;     // scale_type
-            case 33: scale_chord = val % NUM_CHORDS;               goto cc_done;     // scale_chord
+            case  31: opl2_write_bits(0xbd, 0, INST, 7, 1, val ? 1 : 0); goto cc_done; // am_depth
+            case  32: opl2_write_bits(0xbd, 0, INST, 7, 1, val ? 1 : 0); goto cc_done; // vib_depth
+            case  33: chord_cc_enabled = val > 0 ? 1 : 0;                goto cc_done;
 
-            // TODO global
-            //      amdep, vibdep, chord_cc_enabled
+            case  40: scale_root  = val % 12;         fill_scale(); goto cc_done;
+            case  41: scale_type  = val % NUM_SCALES; fill_scale(); goto cc_done;
+            case  42: scale_chord = val % NUM_CHORDS;               goto cc_done;
 
-            // TODO trigcond
+            case  50: trigcond_p1[trig_group_idx] = val; goto cc_done;
+            case  51: trigcond_p2[trig_group_idx] = val; goto cc_done;
 
-            // TODO trigfx
+            case  60: trigfx_idelay[trig_group_idx]  = val; goto cc_done;
+            case  61: trigfx_nrepeat[trig_group_idx] = val; goto cc_done;
+            case  62: trigfx_rdelay[trig_group_idx]  = val; goto cc_done;
+            case  63: trigfx_rdelta[trig_group_idx]  = val; goto cc_done;
 
-            // TODO arp
+            case  70: arp_len[arp_group_idx] = val;
+                      if (arp_len[arp_group_idx] > 12) arp_len[arp_group_idx] = 12;
+                      goto cc_done;
+            case  71: arp_notenum[12*arp_group_idx+0]  = val; goto cc_done;
+            case  72: arp_notenum[12*arp_group_idx+1]  = val; goto cc_done;
+            case  73: arp_notenum[12*arp_group_idx+2]  = val; goto cc_done;
+            case  74: arp_notenum[12*arp_group_idx+3]  = val; goto cc_done;
+            case  75: arp_notenum[12*arp_group_idx+4]  = val; goto cc_done;
+            case  76: arp_notenum[12*arp_group_idx+5]  = val; goto cc_done;
+            case  77: arp_notenum[12*arp_group_idx+6]  = val; goto cc_done;
+            case  78: arp_notenum[12*arp_group_idx+7]  = val; goto cc_done;
+            case  79: arp_notenum[12*arp_group_idx+8]  = val; goto cc_done;
+            case  80: arp_notenum[12*arp_group_idx+9]  = val; goto cc_done;
+            case  81: arp_notenum[12*arp_group_idx+10] = val; goto cc_done;
+            case  82: arp_notenum[12*arp_group_idx+11] = val; goto cc_done;
 
-            // TODO lfo
-
+            case  91: arp_notelen[12*arp_group_idx+0]  = val; goto cc_done;
+            case  92: arp_notelen[12*arp_group_idx+1]  = val; goto cc_done;
+            case  93: arp_notelen[12*arp_group_idx+2]  = val; goto cc_done;
+            case  94: arp_notelen[12*arp_group_idx+3]  = val; goto cc_done;
+            case  95: arp_notelen[12*arp_group_idx+4]  = val; goto cc_done;
+            case  96: arp_notelen[12*arp_group_idx+5]  = val; goto cc_done;
+            case  97: arp_notelen[12*arp_group_idx+6]  = val; goto cc_done;
+            case  98: arp_notelen[12*arp_group_idx+7]  = val; goto cc_done;
+            case  99: arp_notelen[12*arp_group_idx+8]  = val; goto cc_done;
+            case 100: arp_notelen[12*arp_group_idx+9]  = val; goto cc_done;
+            case 101: arp_notelen[12*arp_group_idx+10] = val; goto cc_done;
+            case 102: arp_notelen[12*arp_group_idx+11] = val; goto cc_done;
         }
     }
 cc_done: (void)cc;
 }
 
-void handle_seq_tick() {
-    // TODO arp
-    // TODO lfo
+void handle_arp() {
+    byte i, tmp;
+    for (i = 0; i < 3; ++i) {
+        if (arp_count[i] > 0) {
+            // decrement counter
+            --arp_count[i];
+        }
+        if (arp_count[i] == 0 && arp_len[i] > 0 && arp_on[i] > 0) {
+            // note on/off
+            tmp = arp_notenum[12*i+arp_idx[i]];
+            if (tmp < 1) tmp = 1;
+            handle_note(i, tmp, ARP_VEL);
+            time_seq_queue_delta = ARP_NOTE_OFF_DELTA;
+            handle_note(i, tmp, 0);
+            time_seq_queue_delta = 0;
+
+            // reset counter
+            tmp = arp_notelen[12*i+arp_idx[i]];
+            if (tmp < 3) tmp = 3;
+            arp_count[i] = tmp;
+
+            // increment index
+            ++arp_idx[i];
+            if (arp_idx[i] >= arp_len[i]) {
+                arp_idx[i] = 0;
+            }
+        }
+    }
 }
 
 void handle_midi_time(byte val) {
     switch (val) {
         case 0xfa: // start
-            time_play = 1;
+        case 0xfb: // continue
             time_seq_idx_current = 0;
             time_seq_idx_consumed = SEQ_SIZE-1;
-            break;
-        case 0xfb: // continue
+            memset(&trigcond_count, 0, sizeof(byte));
+            memset(&arp_idx, 0, sizeof(byte));
+            memset(&arp_count, 0, sizeof(byte));
             time_play = 1;
             break;
         case 0xfc: // stop
             time_play = 0;
+            memset(&arp_on, 0, sizeof(byte));
             break;
         case 0xf8: // clock
             if (time_play == 1) {
-                handle_seq_tick();
+                handle_arp();
                 ++time_seq_idx_current;
                 if (time_seq_idx_current >= SEQ_SIZE) {
                     time_seq_idx_current = 0;
@@ -731,4 +908,9 @@ event_t *find_free_event() {
         }
     }
     return NULL;
+}
+
+void toggle_led() {
+    led = 1 - led;
+    digitalWrite(PIN_LED, led ? HIGH : LOW);
 }
